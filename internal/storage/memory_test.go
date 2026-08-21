@@ -1,17 +1,20 @@
 package storage
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"minitsdb/internal/compress"
 	"minitsdb/internal/model"
 )
 
 func newTestStore(t *testing.T) *MemoryStorage {
 	t.Helper()
 	walPath := filepath.Join(t.TempDir(), "test.wal")
-	s, err := NewMemoryStorage(walPath)
+	// A small threshold keeps the flush behaviour easy to assert on.
+	s, err := NewMemoryStorage(walPath, 5)
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
@@ -22,9 +25,11 @@ func TestAppendAndRangeQuery(t *testing.T) {
 	s := newTestStore(t)
 	labels := model.Labels{"region": "apac"}
 
-	mustAppend(t, s, model.Sample{Metric: "cpu", Labels: labels, Point: model.Point{Timestamp: 300, Value: 3.0}})
+	// Samples must arrive in increasing timestamp order: the head stores one
+	// append-only compressed stream per series.
 	mustAppend(t, s, model.Sample{Metric: "cpu", Labels: labels, Point: model.Point{Timestamp: 100, Value: 1.0}})
 	mustAppend(t, s, model.Sample{Metric: "cpu", Labels: labels, Point: model.Point{Timestamp: 200, Value: 2.0}})
+	mustAppend(t, s, model.Sample{Metric: "cpu", Labels: labels, Point: model.Point{Timestamp: 300, Value: 3.0}})
 
 	got := s.Query("cpu", labels, 150, 250)
 	if len(got) != 1 {
@@ -129,7 +134,7 @@ func TestRestartRecoversBlocksAndWAL(t *testing.T) {
 	walPath := filepath.Join(dir, "test.wal")
 	labels := model.Labels{"host": "a"}
 
-	s, err := NewMemoryStorage(walPath)
+	s, err := NewMemoryStorage(walPath, 5)
 	if err != nil {
 		t.Fatalf("create store: %v", err)
 	}
@@ -142,7 +147,7 @@ func TestRestartRecoversBlocksAndWAL(t *testing.T) {
 	}
 
 	// restart
-	s2, err := NewMemoryStorage(walPath)
+	s2, err := NewMemoryStorage(walPath, 5)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}
@@ -154,5 +159,91 @@ func TestRestartRecoversBlocksAndWAL(t *testing.T) {
 	got := s2.Query("cpu", labels, 0, 100)
 	if len(got) != 7 {
 		t.Fatalf("expected 7 points after restart, got %d", len(got))
+	}
+}
+
+// A sample older than the last one for its series is rejected, and must not
+// reach the WAL: replay would hit the same rejection after a restart, leaving
+// a log that no longer describes a state the head can reach.
+func TestAppendRejectsOutOfOrder(t *testing.T) {
+	dir := t.TempDir()
+	walPath := filepath.Join(dir, "test.wal")
+	labels := model.Labels{"host": "a"}
+
+	s, err := NewMemoryStorage(walPath, 5)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+
+	mustAppend(t, s, model.Sample{Metric: "cpu", Labels: labels, Point: model.Point{Timestamp: 200, Value: 2}})
+
+	older := model.Sample{Metric: "cpu", Labels: labels, Point: model.Point{Timestamp: 100, Value: 1}}
+	if err := s.Append(older); !errors.Is(err, compress.ErrOutOfOrder) {
+		t.Fatalf("older timestamp: expected ErrOutOfOrder, got %v", err)
+	}
+	duplicate := model.Sample{Metric: "cpu", Labels: labels, Point: model.Point{Timestamp: 200, Value: 9}}
+	if err := s.Append(duplicate); !errors.Is(err, compress.ErrOutOfOrder) {
+		t.Fatalf("duplicate timestamp: expected ErrOutOfOrder, got %v", err)
+	}
+
+	// Ordering is tracked per series, so a different series starts fresh.
+	other := model.Labels{"host": "b"}
+	mustAppend(t, s, model.Sample{Metric: "cpu", Labels: other, Point: model.Point{Timestamp: 50, Value: 5}})
+
+	if got := s.Query("cpu", labels, 0, 1000); len(got) != 1 || got[0].Value != 2 {
+		t.Fatalf("rejected samples must not be stored, got %v", got)
+	}
+
+	// The WAL must hold only the two accepted samples.
+	data, err := os.ReadFile(walPath)
+	if err != nil {
+		t.Fatalf("read wal: %v", err)
+	}
+	lines := 0
+	for _, b := range data {
+		if b == '\n' {
+			lines++
+		}
+	}
+	if lines != 2 {
+		t.Fatalf("WAL should hold 2 accepted samples, got %d lines:\n%s", lines, data)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Replay must succeed, since no rejected sample was ever logged.
+	s2, err := NewMemoryStorage(walPath, 5)
+	if err != nil {
+		t.Fatalf("reopen after rejections: %v", err)
+	}
+	defer s2.Close()
+	if got := s2.Query("cpu", labels, 0, 1000); len(got) != 1 {
+		t.Fatalf("after restart expected 1 point, got %d", len(got))
+	}
+}
+
+// Values must survive the compressed round trip, through the head and after a
+// flush to disk.
+func TestValuesSurviveCompression(t *testing.T) {
+	s := newTestStore(t)
+	labels := model.Labels{"host": "a"}
+	want := []float64{0, 1.5, -2.25, 1e300, 1e-300, 42, 42, 3.14159265358979}
+
+	for i, v := range want {
+		mustAppend(t, s, model.Sample{
+			Metric: "cpu", Labels: labels,
+			Point: model.Point{Timestamp: int64(i+1) * 10, Value: v},
+		})
+	}
+
+	got := s.Query("cpu", labels, 0, 10000)
+	if len(got) != len(want) {
+		t.Fatalf("got %d points, want %d", len(got), len(want))
+	}
+	for i, p := range got {
+		if p.Value != want[i] {
+			t.Errorf("point %d: got %v, want %v", i, p.Value, want[i])
+		}
 	}
 }

@@ -3,8 +3,8 @@ package compress
 import "io"
 
 type BitWriter struct {
-	buf []byte
-	cur byte
+	buf   []byte
+	cur   byte
 	nbits uint8
 }
 
@@ -14,7 +14,7 @@ func NewBitWriter() *BitWriter {
 
 func (w *BitWriter) WriteBit(v uint8) {
 	w.cur <<= 1
-	if v & 1 == 1 {
+	if v&1 == 1 {
 		w.cur |= 1
 	}
 	w.nbits++
@@ -43,12 +43,12 @@ func (w *BitWriter) Bytes() []byte {
 }
 
 type BitReader struct {
-	buf []byte
+	buf   []byte
 	nbits uint8
-	pos int
+	pos   int
 }
 
-//read individual bits, MSB-first, from a byte buffer
+// read individual bits, MSB-first, from a byte buffer
 func NewBitReader(buf []byte) *BitReader {
 	return &BitReader{buf: buf}
 }
@@ -80,4 +80,3 @@ func (r *BitReader) ReadBits(n uint8) (uint64, error) {
 	}
 	return v, nil
 }
-

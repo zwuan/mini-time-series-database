@@ -49,11 +49,11 @@ func TestValueEdgeCases(t *testing.T) {
 	valueRoundTrip(t, []float64{0})
 	valueRoundTrip(t, []float64{0, 0, 0})
 	valueRoundTrip(t, []float64{0, 1, 0, 1, 0})
-	valueRoundTrip(t, []float64{-0.0, 0.0, -0.0})              // signed zero
-	valueRoundTrip(t, []float64{5.5, -5.5, 5.5, -5.5})         // sign flips: xor hits the top bit
+	valueRoundTrip(t, []float64{-0.0, 0.0, -0.0})      // signed zero
+	valueRoundTrip(t, []float64{5.5, -5.5, 5.5, -5.5}) // sign flips: xor hits the top bit
 	valueRoundTrip(t, []float64{math.MaxFloat64, math.SmallestNonzeroFloat64, 0})
 	valueRoundTrip(t, []float64{math.Inf(1), math.Inf(-1), 0, math.NaN(), 1})
-	valueRoundTrip(t, []float64{1e-300, 1e300, -1e300})        // denormals and extremes
+	valueRoundTrip(t, []float64{1e-300, 1e300, -1e300})                  // denormals and extremes
 	valueRoundTrip(t, []float64{1.0000000000000002, 1.0000000000000004}) // low-bit changes only
 }
 

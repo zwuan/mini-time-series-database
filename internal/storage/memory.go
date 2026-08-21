@@ -1,17 +1,19 @@
 package storage
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
+	"log"
+	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"bufio"
-	"log"
 
+	"minitsdb/internal/compress"
 	"minitsdb/internal/model"
 )
 
@@ -19,26 +21,38 @@ const blockFilePrefix = "block-"
 const blockFileSuffix = ".json"
 
 type MemoryStorage struct {
-	mu   sync.RWMutex
-	series map[string][]model.Point
-	wal *os.File
+	mu     sync.RWMutex
+	series map[string]*compress.Chunk
+	wal    *os.File
 
-	walPath string
-	blockDir string
-	BlockSeq int
-	pointCount int
+	walPath        string
+	blockDir       string
+	BlockSeq       int
+	pointCount     int
 	flushThreshold int
+}
+
+type blockSeries struct {
+	Count int    `json:"count"`
+	TS    []byte `json:"ts"`
+	Val   []byte `json:"val"`
 }
 
 // block is the immutable on-disk block file format.
 // min_ts / max_ts let queries skip irrelevant blocks (block pruning).
 type block struct {
-	MinTS  int64                    `json:"min_ts"`
-	MaxTS  int64                    `json:"max_ts"`
-	Series map[string][]model.Point `json:"series"`
+	MinTS  int64                  `json:"min_ts"`
+	MaxTS  int64                  `json:"max_ts"`
+	Series map[string]blockSeries `json:"series"`
 }
 
-func NewMemoryStorage(walPath string) (*MemoryStorage, error) {
+const DefaultFlushThreshold = 1000
+
+func NewMemoryStorage(walPath string, flushThreshold int) (*MemoryStorage, error) {
+	if flushThreshold <= 0 {
+		flushThreshold = DefaultFlushThreshold
+	}
+
 	if err := os.MkdirAll(filepath.Dir(walPath), 0o755); err != nil {
 		return nil, err
 	}
@@ -55,13 +69,13 @@ func NewMemoryStorage(walPath string) (*MemoryStorage, error) {
 	}
 
 	s := &MemoryStorage{
-		series: make(map[string][]model.Point),
-		wal: f,
-		walPath: walPath,
-		blockDir: blockDir,
-		BlockSeq: 0,
-		pointCount: 0,
-		flushThreshold: 5, // flush threshold, set to 5 points for example
+		series:         make(map[string]*compress.Chunk),
+		wal:            f,
+		walPath:        walPath,
+		blockDir:       blockDir,
+		BlockSeq:       0,
+		pointCount:     0,
+		flushThreshold: flushThreshold,
 	}
 
 	// Continue numbering from existing blocks so a restart never overwrites old ones.
@@ -72,8 +86,7 @@ func NewMemoryStorage(walPath string) (*MemoryStorage, error) {
 	}
 	s.BlockSeq = seq
 
-	// Blocks stay on disk and are not loaded back; the WAL only holds samples
-	// written since the last checkpoint.
+	// Blocks stay on disk and are not loaded back; the WAL only holds samples written since the last checkpoint.
 	if err := s.replay(walPath); err != nil {
 		f.Close()
 		return nil, err
@@ -124,7 +137,9 @@ func (s *MemoryStorage) replay(walPath string) error {
 		if err := json.Unmarshal(line, &sample); err != nil {
 			return err
 		}
-		s.appendMemory(sample)
+		if err := s.appendMemory(sample); err != nil {
+			return fmt.Errorf("replay sample %d: %w", count+1, err)
+		}
 		count++
 	}
 	if err := scanner.Err(); err != nil {
@@ -134,30 +149,55 @@ func (s *MemoryStorage) replay(walPath string) error {
 	return nil
 }
 
-func (s *MemoryStorage) appendMemory(sample model.Sample) {
+// appendMemory writes the sample into the series' compressed chunk, creating the chunk on first use.
+func (s *MemoryStorage) appendMemory(sample model.Sample) error {
 	key := model.SeriesKey(sample.Metric, sample.Labels)
-	points := append(s.series[key], sample.Point)
-	sort.Slice(points, func(i, j int) bool {
-		return points[i].Timestamp < points[j].Timestamp
-	})
-	s.series[key] = points
+	c := s.series[key]
+	if c == nil {
+		c = compress.NewChunk()
+		s.series[key] = c
+	}
+	if err := c.Append(sample.Point.Timestamp, sample.Point.Value); err != nil {
+		return err
+	}
 	s.pointCount++
+	return nil
 }
 
+// checkOrder reports whether the sample can be appended to its series
+// A compressed chunk is an append-only stream, so a sample that is not newer than the last one cannot be stored
+func (s *MemoryStorage) checkOrder(sample model.Sample) error {
+	key := model.SeriesKey(sample.Metric, sample.Labels)
+	c := s.series[key]
+	if c == nil || c.Count() == 0 {
+		return nil
+	}
+	if sample.Point.Timestamp <= c.MaxTS() {
+		return fmt.Errorf("%w: series %q got %d, last was %d",
+			compress.ErrOutOfOrder, key, sample.Point.Timestamp, c.MaxTS())
+	}
+	return nil
+}
 
-func (s *MemoryStorage) Append(sample model.Sample) error{
+func (s *MemoryStorage) Append(sample model.Sample) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.checkOrder(sample); err != nil {
+		return err
+	}
+
 	line, err := json.Marshal(sample)
 	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if _, err := s.wal.Write(append(line, '\n')); err != nil {
 		return err
 	}
 
-	s.appendMemory(sample)
+	if err := s.appendMemory(sample); err != nil {
+		return err
+	}
 
 	if s.pointCount >= s.flushThreshold {
 		if err := s.flush(); err != nil {
@@ -168,34 +208,31 @@ func (s *MemoryStorage) Append(sample model.Sample) error{
 	return nil
 }
 
-// flush persists the current in-memory data as one immutable block file, then
-// truncates the WAL and clears the head. The caller must already hold s.mu.
-//
-// The ordering is crash-safe and must not be reordered:
-//   1. write block to tmp -> fsync -> rename (atomic)
-//   2. fsync the directory
-//   3. truncate the WAL (checkpoint)
-//   4. clear the head, reset pointCount, bump BlockSeq
-// Truncating the WAL before the block is durable would lose data on a crash.
 func (s *MemoryStorage) flush() error {
 	if len(s.series) == 0 {
 		return nil
 	}
 
 	b := block{
-		MinTS:  int64(^uint64(0) >> 1),  // max int64
-		MaxTS:  -1 << 63,                // min int64
-		Series: s.series,
+		MinTS:  math.MaxInt64,
+		MaxTS:  math.MinInt64,
+		Series: make(map[string]blockSeries, len(s.series)),
 	}
-	for _, points := range s.series {
-		for _, p := range points {
-			if p.Timestamp < b.MinTS {
-				b.MinTS = p.Timestamp
-			}
-			if p.Timestamp > b.MaxTS {
-				b.MaxTS = p.Timestamp
-			}
+	for key, c := range s.series {
+		if c.Count() == 0 {
+			continue
 		}
+		tsBuf, valBuf := c.Bytes()
+		b.Series[key] = blockSeries{Count: c.Count(), TS: tsBuf, Val: valBuf}
+		if c.MinTS() < b.MinTS {
+			b.MinTS = c.MinTS()
+		}
+		if c.MaxTS() > b.MaxTS {
+			b.MaxTS = c.MaxTS()
+		}
+	}
+	if len(b.Series) == 0 {
+		return nil
 	}
 
 	seq := s.BlockSeq + 1
@@ -246,7 +283,7 @@ func (s *MemoryStorage) flush() error {
 	}
 
 	// 4. clear the head
-	s.series = make(map[string][]model.Point)
+	s.series = make(map[string]*compress.Chunk)
 	s.pointCount = 0
 	s.BlockSeq = seq
 
@@ -270,10 +307,17 @@ func (s *MemoryStorage) Query(metric string, labels model.Labels, start, end int
 
 	result := make([]model.Point, 0)
 
-	// in-memory head
-	for _, p := range s.series[key] {
-		if p.Timestamp >= start && p.Timestamp <= end {
-			result = append(result, p)
+	// in-memory head: the chunk is decoded from the start, since every sample depends on the one before it
+	if c := s.series[key]; c != nil {
+		it := c.Iterator()
+		for it.Next() {
+			ts, v := it.At()
+			if ts >= start && ts <= end {
+				result = append(result, model.Point{Timestamp: ts, Value: v})
+			}
+		}
+		if err := it.Err(); err != nil {
+			log.Printf("decode head chunk %q: %v", key, err)
 		}
 	}
 
@@ -316,10 +360,19 @@ func (s *MemoryStorage) queryBlocks(key string, start, end int64) ([]model.Point
 		if b.MaxTS < start || b.MinTS > end {
 			continue
 		}
-		for _, p := range b.Series[key] {
-			if p.Timestamp >= start && p.Timestamp <= end {
-				result = append(result, p)
+		bs, ok := b.Series[key]
+		if !ok {
+			continue
+		}
+		it := compress.NewChunkIterator(bs.TS, bs.Val, bs.Count)
+		for it.Next() {
+			ts, v := it.At()
+			if ts >= start && ts <= end {
+				result = append(result, model.Point{Timestamp: ts, Value: v})
 			}
+		}
+		if err := it.Err(); err != nil {
+			return nil, fmt.Errorf("decode block %s series %q: %w", name, key, err)
 		}
 	}
 	return result, nil

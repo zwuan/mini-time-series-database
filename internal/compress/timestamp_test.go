@@ -57,10 +57,10 @@ func TestTimestampAllControlBranches(t *testing.T) {
 }
 
 func TestTimestampEdgeCases(t *testing.T) {
-	roundTrip(t, []int64{5})                                          // single point
-	roundTrip(t, []int64{0, 0, 0, 0})                                 // all identical
-	roundTrip(t, []int64{-1000, -900, -800, -700})                    // negative
-	roundTrip(t, []int64{500, 400, 300, 200})                         // decreasing
+	roundTrip(t, []int64{5})                                                      // single point
+	roundTrip(t, []int64{0, 0, 0, 0})                                             // all identical
+	roundTrip(t, []int64{-1000, -900, -800, -700})                                // negative
+	roundTrip(t, []int64{500, 400, 300, 200})                                     // decreasing
 	roundTrip(t, []int64{math.MaxInt64 - 100, math.MaxInt64 - 50, math.MaxInt64}) // extremes
 }
 

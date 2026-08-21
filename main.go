@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"net/http"
 
@@ -9,7 +10,14 @@ import (
 )
 
 func main() {
-	store, err := storage.NewMemoryStorage("data/wal.log")
+	addr := flag.String("addr", ":8080", "address to listen on")
+	walPath := flag.String("wal", "data/wal.log", "path to the write-ahead log")
+	flushThreshold := flag.Int("flush", storage.DefaultFlushThreshold,
+		"number of samples buffered in memory before flushing to a block")
+	flag.Parse()
+
+	store, err := storage.NewMemoryStorage(*walPath, *flushThreshold)
+
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -20,10 +28,9 @@ func main() {
 	mux := http.NewServeMux()
 	handler.Register(mux)
 
-	addr := ":8080"
-	log.Printf("MiniTSDB listening on %s", addr)
+	log.Printf("MiniTSDB listening on %s (flush threshold %d)", *addr, *flushThreshold)
 
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := http.ListenAndServe(*addr, mux); err != nil {
 		log.Fatal(err)
 	}
 }

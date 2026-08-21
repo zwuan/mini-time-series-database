@@ -1,6 +1,6 @@
 package model
 
-import  (
+import (
 	"sort"
 	"strings"
 )
@@ -10,10 +10,10 @@ type Labels map[string]string
 type Sample struct {
 	Metric string `json:"metric"`
 	Labels Labels `json:"labels"`
-	Point Point	`json:"point"`
+	Point  Point  `json:"point"`
 }
 type Point struct {
-	Timestamp int64	`json:"timestamp"`
+	Timestamp int64   `json:"timestamp"`
 	Value     float64 `json:"value"`
 }
 
@@ -23,7 +23,7 @@ func SeriesKey(metric string, labels Labels) string {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	
+
 	var sb strings.Builder
 	sb.WriteString(metric)
 	for _, k := range keys {
@@ -34,4 +34,3 @@ func SeriesKey(metric string, labels Labels) string {
 	}
 	return sb.String()
 }
-

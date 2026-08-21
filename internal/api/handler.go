@@ -2,8 +2,11 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
+
+	"minitsdb/internal/compress"
 	"minitsdb/internal/model"
 	"minitsdb/internal/storage"
 )
@@ -16,7 +19,7 @@ func NewHandler(store *storage.MemoryStorage) *Handler {
 	return &Handler{store: store}
 }
 
-func(h *Handler) Register(mux *http.ServeMux) {
+func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /write", h.HandleWrite)
 	mux.HandleFunc("GET /query", h.HandleQuery)
 }
@@ -28,13 +31,17 @@ func (h *Handler) HandleWrite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	
+
 	if sample.Metric == "" {
 		http.Error(w, "metric name is required", http.StatusBadRequest)
 		return
 	}
 
 	if err := h.store.Append(sample); err != nil {
+		if errors.Is(err, compress.ErrOutOfOrder) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -51,7 +58,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := parseIntDefault(q.Get("start"), 0)
-	end := parseIntDefault(q.Get("end"), 1 << 62)
+	end := parseIntDefault(q.Get("end"), 1<<62)
 
 	labels := model.Labels{}
 	for key, values := range q {
@@ -64,7 +71,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	points := h.store.Query(metric, labels, start, end)
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(points); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

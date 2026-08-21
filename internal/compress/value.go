@@ -7,20 +7,20 @@ import (
 
 const noWindow = 0xFF
 
-type ＶalueEncoder struct {
-	w *BitWriter
-	prev uint64
-	leading uint8
+type ValueEncoder struct {
+	w        *BitWriter
+	prev     uint64
+	leading  uint8
 	trailing uint8
-	n int
+	n        int
 }
 
-func NewValueEncoder() *ＶalueEncoder {
-	return &ＶalueEncoder{w: NewBitWriter(), leading: noWindow}
+func NewValueEncoder() *ValueEncoder {
+	return &ValueEncoder{w: NewBitWriter(), leading: noWindow}
 }
 
 // Write encodes a float64 value to the underlying bit stream
-func (e *ＶalueEncoder) Write(v float64) {
+func (e *ValueEncoder) Write(v float64) {
 	cur := math.Float64bits(v)
 	if e.n == 0 {
 		e.w.WriteBits(cur, 64)
@@ -34,7 +34,7 @@ func (e *ＶalueEncoder) Write(v float64) {
 		e.w.WriteBit(0)
 	} else {
 		e.w.WriteBit(1)
-		
+
 		lead := uint8(mbits.LeadingZeros64(xor))
 		trail := uint8(mbits.TrailingZeros64(xor))
 		if lead >= 32 {
@@ -60,28 +60,27 @@ func (e *ＶalueEncoder) Write(v float64) {
 	e.n++
 }
 
-func (e *ＶalueEncoder) Bytes() []byte {
+func (e *ValueEncoder) Bytes() []byte {
 	return e.w.Bytes()
 }
 
-func (e *ＶalueEncoder) Count() int {
+func (e *ValueEncoder) Count() int {
 	return e.n
 }
 
-type ＶalueDecoder struct {
-	r *BitReader
-	prev uint64
-	leading uint8
+type ValueDecoder struct {
+	r        *BitReader
+	prev     uint64
+	leading  uint8
 	trailing uint8
-	n int
+	n        int
 }
 
-
-func NewValueDecoder(buf []byte) *ＶalueDecoder {
-	return &ＶalueDecoder{r: NewBitReader(buf), leading: noWindow}
+func NewValueDecoder(buf []byte) *ValueDecoder {
+	return &ValueDecoder{r: NewBitReader(buf), leading: noWindow}
 }
 
-func (d *ＶalueDecoder) Read() (float64, error) {
+func (d *ValueDecoder) Read() (float64, error) {
 	if d.n == 0 {
 		v, err := d.r.ReadBits(64)
 		if err != nil {
@@ -91,7 +90,7 @@ func (d *ＶalueDecoder) Read() (float64, error) {
 		d.n++
 		return math.Float64frombits(v), nil
 	}
-	
+
 	bit, err := d.r.ReadBit()
 	if err != nil {
 		return 0, err
@@ -125,10 +124,9 @@ func (d *ＶalueDecoder) Read() (float64, error) {
 		if err != nil {
 			return 0, err
 		}
-		// XOR its own inverse 
+		// XOR its own inverse
 		d.prev ^= v << d.trailing
 	}
 	d.n++
 	return math.Float64frombits(d.prev), nil
 }
-
