@@ -34,6 +34,9 @@ func blockDirSize(t testing.TB, dir string) int64 {
 // TestEndToEndCompression measures what actually lands on disk, including the
 // JSON and base64 overhead of the block format -- not just the encoders.
 func TestEndToEndCompression(t *testing.T) {
+	if testing.Short() {
+		t.Skip("measurement test; run without -short")
+	}
 	const n = 10000
 	shapes := []struct {
 		name string
@@ -79,6 +82,9 @@ func TestEndToEndCompression(t *testing.T) {
 // the head is flushed. Each flush costs three fsyncs, so its cost is roughly
 // constant and amortises over the samples buffered before it.
 func TestFlushThresholdTradeoff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("measurement test; run without -short")
+	}
 	const n = 20000
 	for _, threshold := range []int{100, 1000, 10000, 1 << 30} {
 		dir := t.TempDir()
@@ -253,6 +259,9 @@ func seedSamples(b *testing.B, s *MemoryStorage, n int) model.Labels {
 // the functional options in the constructor leaves syncOnWrite false, which
 // compiles and produces no visible failure other than a suspiciously fast run.
 func TestSyncOnWriteCost(t *testing.T) {
+	if testing.Short() {
+		t.Skip("measurement test; run without -short")
+	}
 	const n = 2000
 	rates := map[bool]float64{}
 
