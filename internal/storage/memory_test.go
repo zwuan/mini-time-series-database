@@ -31,7 +31,7 @@ func TestAppendAndRangeQuery(t *testing.T) {
 	mustAppend(t, s, model.Sample{Metric: "cpu", Labels: labels, Point: model.Point{Timestamp: 200, Value: 2.0}})
 	mustAppend(t, s, model.Sample{Metric: "cpu", Labels: labels, Point: model.Point{Timestamp: 300, Value: 3.0}})
 
-	got := s.Query("cpu", labels, 150, 250)
+	got := mustQuery(t, s, "cpu", labels, 150, 250)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 point, got %d", len(got))
 	}
@@ -42,7 +42,7 @@ func TestAppendAndRangeQuery(t *testing.T) {
 
 func TestQueryMissingSeries(t *testing.T) {
 	s := newTestStore(t)
-	got := s.Query("does_not_exist", nil, 0, 1000)
+	got := mustQuery(t, s, "does_not_exist", nil, 0, 1000)
 	if len(got) != 0 {
 		t.Errorf("missing series should return empty, got %d points", len(got))
 	}
@@ -53,6 +53,15 @@ func mustAppend(t *testing.T, s *MemoryStorage, sample model.Sample) {
 	if err := s.Append(sample); err != nil {
 		t.Fatalf("append failed: %v", err)
 	}
+}
+
+func mustQuery(t *testing.T, s *MemoryStorage, metric string, labels model.Labels, start, end int64) []model.Point {
+	t.Helper()
+	got, err := s.Query(metric, labels, start, end)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	return got
 }
 
 // Writing flushThreshold samples should produce one block, clear the head and
@@ -91,7 +100,7 @@ func TestFlushToBlockAndQueryMerge(t *testing.T) {
 	}
 
 	// Data moved from memory to disk, but Query should still read all 5 points.
-	got := s.Query("cpu", labels, 0, 100)
+	got := mustQuery(t, s, "cpu", labels, 0, 100)
 	if len(got) != 5 {
 		t.Fatalf("expected 5 points from block, got %d", len(got))
 	}
@@ -115,7 +124,7 @@ func TestQueryMergesBlockAndHead(t *testing.T) {
 	mustAppend(t, s, model.Sample{Metric: "cpu", Labels: labels, Point: model.Point{Timestamp: 6, Value: 6}})
 	mustAppend(t, s, model.Sample{Metric: "cpu", Labels: labels, Point: model.Point{Timestamp: 7, Value: 7}})
 
-	got := s.Query("cpu", labels, 0, 100)
+	got := mustQuery(t, s, "cpu", labels, 0, 100)
 	if len(got) != 7 {
 		t.Fatalf("expected 7 merged points, got %d", len(got))
 	}
@@ -156,7 +165,7 @@ func TestRestartRecoversBlocksAndWAL(t *testing.T) {
 	if s2.BlockSeq != 1 {
 		t.Fatalf("expected BlockSeq continued at 1 after restart, got %d", s2.BlockSeq)
 	}
-	got := s2.Query("cpu", labels, 0, 100)
+	got := mustQuery(t, s2, "cpu", labels, 0, 100)
 	if len(got) != 7 {
 		t.Fatalf("expected 7 points after restart, got %d", len(got))
 	}
@@ -190,7 +199,7 @@ func TestAppendRejectsOutOfOrder(t *testing.T) {
 	other := model.Labels{"host": "b"}
 	mustAppend(t, s, model.Sample{Metric: "cpu", Labels: other, Point: model.Point{Timestamp: 50, Value: 5}})
 
-	if got := s.Query("cpu", labels, 0, 1000); len(got) != 1 || got[0].Value != 2 {
+	if got := mustQuery(t, s, "cpu", labels, 0, 1000); len(got) != 1 || got[0].Value != 2 {
 		t.Fatalf("rejected samples must not be stored, got %v", got)
 	}
 
@@ -218,7 +227,7 @@ func TestAppendRejectsOutOfOrder(t *testing.T) {
 		t.Fatalf("reopen after rejections: %v", err)
 	}
 	defer s2.Close()
-	if got := s2.Query("cpu", labels, 0, 1000); len(got) != 1 {
+	if got := mustQuery(t, s2, "cpu", labels, 0, 1000); len(got) != 1 {
 		t.Fatalf("after restart expected 1 point, got %d", len(got))
 	}
 }
@@ -237,7 +246,7 @@ func TestValuesSurviveCompression(t *testing.T) {
 		})
 	}
 
-	got := s.Query("cpu", labels, 0, 10000)
+	got := mustQuery(t, s, "cpu", labels, 0, 10000)
 	if len(got) != len(want) {
 		t.Fatalf("got %d points, want %d", len(got), len(want))
 	}

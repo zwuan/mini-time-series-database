@@ -9,7 +9,8 @@ metrics efficiently.
 ## Features (so far)
 - Ingest metrics (`metric` + `labels` + `timestamp` + `value`) via HTTP
 - Label-based, time-range queries
-- Write-ahead log (WAL) for crash-safe durability
+- Write-ahead log (WAL) for crash-safe durability, with optional per-write
+  fsync (`-sync`)
 - Automatic recovery: replays the WAL on startup
 - Disk tiering: the in-memory head is periodically flushed into immutable
   block files, so memory does not grow unbounded
@@ -32,9 +33,10 @@ Timestamps must increase per series; an older or duplicate timestamp is
 rejected with `400`, since the head keeps one append-only compressed stream
 per series.
 
-Flags: `-addr` (default `:8080`), `-wal` (default `data/wal.log`), and
-`-flush`, the number of samples buffered before a block is written. Lower it
-to watch flushing happen:
+Flags: `-addr` (default `:8080`), `-wal` (default `data/wal.log`), `-flush`
+(samples buffered before a block is written), and `-sync` (fsync the WAL on
+every write — durable but far slower; see "Durability" below). Lower the flush
+threshold to watch flushing happen:
 
 ```bash
 go run . -flush 5
@@ -147,6 +149,27 @@ WAL. That is why throughput scales almost linearly with the flush threshold,
 and why **compression is not the bottleneck: durability is.** Batching WAL
 writes and fsyncs is the obvious next optimisation.
 
+### Durability: what `Write` does and does not promise
+By default the WAL is appended to but not fsynced per sample, so a freshly
+written sample lives in the OS page cache until the next flush. A process
+crash loses nothing — the file is already written — but a power loss drops
+whatever arrived since the last flush.
+
+`-sync` closes that window by fsyncing on every append. It is off by default
+because of what it costs:
+
+| Mode | Throughput | Per sample |
+|---|---|---|
+| WAL buffered (default) | 228,022 points/sec | 4.4 µs |
+| `-sync`, fsync every append | 257 points/sec | 3,890 µs |
+
+**887x slower**, because each fsync waits on the physical device (~3.9 ms).
+Prometheus makes the same default choice: for metrics, losing a few seconds of
+samples on power loss beats an ingest path that can absorb only a few hundred
+points per second. Workloads that cannot tolerate the gap can pay for it
+explicitly. Group commit — fsyncing once per batch on a timer — would be the
+middle ground, and is the natural next step.
+
 ### Query latency
 Decoding 10,000 samples for one series:
 
@@ -183,6 +206,8 @@ checkpoint; already-flushed blocks stay on disk and are read at query time.
 - [x] In-memory store + HTTP API
 - [x] WAL persistence & recovery
 - [x] On-disk block flushing + WAL checkpointing
+- [x] Configurable durability and flush thresholds
+- [ ] Group commit (batched WAL fsync)
 - [ ] Block compaction (merge small blocks)
 - [x] Gorilla-style timestamp compression (delta-of-delta)
 - [x] Gorilla-style value compression (float64 XOR)

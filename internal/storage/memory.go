@@ -30,6 +30,14 @@ type MemoryStorage struct {
 	BlockSeq       int
 	pointCount     int
 	flushThreshold int
+	syncOnWrite    bool
+}
+
+// Option is a functional option for configuring the MemoryStorage
+type Option func(*MemoryStorage)
+
+func WithSyncOnWrite() Option {
+	return func(s *MemoryStorage) { s.syncOnWrite = true }
 }
 
 type blockSeries struct {
@@ -48,7 +56,7 @@ type block struct {
 
 const DefaultFlushThreshold = 1000
 
-func NewMemoryStorage(walPath string, flushThreshold int) (*MemoryStorage, error) {
+func NewMemoryStorage(walPath string, flushThreshold int, opts ...Option) (*MemoryStorage, error) {
 	if flushThreshold <= 0 {
 		flushThreshold = DefaultFlushThreshold
 	}
@@ -78,6 +86,10 @@ func NewMemoryStorage(walPath string, flushThreshold int) (*MemoryStorage, error
 		flushThreshold: flushThreshold,
 	}
 
+	for _, opt := range opts {
+		opt(s)
+	}
+	
 	// Continue numbering from existing blocks so a restart never overwrites old ones.
 	seq, err := scanMaxBlockSeq(blockDir)
 	if err != nil {
@@ -195,6 +207,12 @@ func (s *MemoryStorage) Append(sample model.Sample) error {
 		return err
 	}
 
+	if s.syncOnWrite {
+		if err := s.wal.Sync(); err != nil {
+			return err
+		}
+	}
+
 	if err := s.appendMemory(sample); err != nil {
 		return err
 	}
@@ -300,7 +318,7 @@ func syncDir(dir string) error {
 	return d.Sync()
 }
 
-func (s *MemoryStorage) Query(metric string, labels model.Labels, start, end int64) []model.Point {
+func (s *MemoryStorage) Query(metric string, labels model.Labels, start, end int64) ([]model.Point, error) {
 	key := model.SeriesKey(metric, labels)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -317,22 +335,21 @@ func (s *MemoryStorage) Query(metric string, labels model.Labels, start, end int
 			}
 		}
 		if err := it.Err(); err != nil {
-			log.Printf("decode head chunk %q: %v", key, err)
+			return nil, fmt.Errorf("decode head chunk %q: %w", key, err)
 		}
 	}
 
 	// on-disk blocks
 	blockPoints, err := s.queryBlocks(key, start, end)
 	if err != nil {
-		log.Printf("query blocks failed: %v", err)
-	} else {
-		result = append(result, blockPoints...)
+		return nil, err
 	}
+	result = append(result, blockPoints...)
 
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].Timestamp < result[j].Timestamp
 	})
-	return result
+	return result, nil
 }
 
 // queryBlocks scans on-disk blocks, reading only those whose time range overlaps (block pruning).

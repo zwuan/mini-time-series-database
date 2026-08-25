@@ -14,7 +14,13 @@ func main() {
 	walPath := flag.String("wal", "data/wal.log", "path to the write-ahead log")
 	flushThreshold := flag.Int("flush", storage.DefaultFlushThreshold,
 		"number of samples buffered in memory before flushing to a block")
+	syncOnWrite := flag.Bool("sync", false, "fsync the WAL on every write; durable but far slower")
 	flag.Parse()
+
+	var opts []storage.Option
+	if *syncOnWrite {
+		opts = append(opts, storage.WithSyncOnWrite())
+	}
 
 	store, err := storage.NewMemoryStorage(*walPath, *flushThreshold)
 

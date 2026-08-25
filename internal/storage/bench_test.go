@@ -191,7 +191,11 @@ func BenchmarkQueryHead(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if got := s.Query("cpu", labels, 0, 1<<62); len(got) != 10000 {
+		got, err := s.Query("cpu", labels, 0, 1<<62)
+		if err != nil {
+			b.Fatalf("query: %v", err)
+		}
+		if len(got) != 10000 {
 			b.Fatalf("got %d points", len(got))
 		}
 	}
@@ -215,7 +219,11 @@ func BenchmarkQueryBlocks(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if got := s2.Query("cpu", labels, 0, 1<<62); len(got) != 10000 {
+		got, err := s2.Query("cpu", labels, 0, 1<<62)
+		if err != nil {
+			b.Fatalf("query: %v", err)
+		}
+		if len(got) != 10000 {
 			b.Fatalf("got %d points", len(got))
 		}
 	}
@@ -235,4 +243,58 @@ func seedSamples(b *testing.B, s *MemoryStorage, n int) model.Labels {
 		ts += 10
 	}
 	return labels
+}
+
+// TestSyncOnWriteCost measures the price of fsyncing the WAL on every append.
+// Without it, samples written since the last flush live only in the OS page
+// cache and are lost on power failure.
+//
+// The assertion guards the option actually taking effect: forgetting to apply
+// the functional options in the constructor leaves syncOnWrite false, which
+// compiles and produces no visible failure other than a suspiciously fast run.
+func TestSyncOnWriteCost(t *testing.T) {
+	const n = 2000
+	rates := map[bool]float64{}
+
+	for _, sync := range []bool{false, true} {
+		dir := t.TempDir()
+		var opts []Option
+		if sync {
+			opts = append(opts, WithSyncOnWrite())
+		}
+		s, err := NewMemoryStorage(filepath.Join(dir, "wal.log"), 1<<30, opts...)
+		if err != nil {
+			t.Fatalf("create store: %v", err)
+		}
+		labels := model.Labels{"host": "a"}
+		ts := int64(1600000000)
+
+		start := time.Now()
+		for i := 0; i < n; i++ {
+			if err := s.Append(model.Sample{
+				Metric: "cpu", Labels: labels,
+				Point: model.Point{Timestamp: ts, Value: float64(i % 100)},
+			}); err != nil {
+				t.Fatalf("append: %v", err)
+			}
+			ts += 10
+		}
+		elapsed := time.Since(start)
+		s.Close()
+
+		rates[sync] = float64(n) / elapsed.Seconds()
+		label := "WAL buffered (default)"
+		if sync {
+			label = "fsync every append"
+		}
+		t.Logf("%-24s %8.0f points/sec (%7.1f us/point)",
+			label, rates[sync], float64(elapsed.Microseconds())/float64(n))
+	}
+
+	// An fsync waits on the physical device, so it must cost far more than a
+	// buffered write. Anything close to parity means no fsync happened.
+	if rates[true] > rates[false]/10 {
+		t.Errorf("fsync should be at least 10x slower, but got %.0f points/sec synced vs %.0f buffered -- is WithSyncOnWrite() being applied?",
+			rates[true], rates[false])
+	}
 }
