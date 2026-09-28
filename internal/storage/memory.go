@@ -14,16 +14,31 @@ import (
 	"sync"
 
 	"minitsdb/internal/compress"
+	"minitsdb/internal/index"
 	"minitsdb/internal/model"
 )
 
 const blockFilePrefix = "block-"
 const blockFileSuffix = ".json"
 
+// seriesMeta is a series' identity. It outlives the head: a flush moves the
+// samples to disk, but the series keeps its ID, its index entries, and the
+// timestamp that later samples must exceed.
+type seriesMeta struct {
+	key    string
+	metric string
+	labels model.Labels
+	lastTS int64
+}
+
 type MemoryStorage struct {
 	mu     sync.RWMutex
-	series map[string]*compress.Chunk
+	series map[string]*compress.Chunk // head: samples not yet flushed
 	wal    *os.File
+
+	ids   map[string]index.SeriesID // series key -> ID
+	meta  []seriesMeta              // indexed by SeriesID
+	index *index.Index
 
 	walPath        string
 	blockDir       string
@@ -79,6 +94,8 @@ func NewMemoryStorage(walPath string, flushThreshold int, opts ...Option) (*Memo
 	s := &MemoryStorage{
 		series:         make(map[string]*compress.Chunk),
 		wal:            f,
+		ids:            make(map[string]index.SeriesID),
+		index:          index.New(),
 		walPath:        walPath,
 		blockDir:       blockDir,
 		BlockSeq:       0,
@@ -89,7 +106,7 @@ func NewMemoryStorage(walPath string, flushThreshold int, opts ...Option) (*Memo
 	for _, opt := range opts {
 		opt(s)
 	}
-	
+
 	// Continue numbering from existing blocks so a restart never overwrites old ones.
 	seq, err := scanMaxBlockSeq(blockDir)
 	if err != nil {
@@ -172,21 +189,51 @@ func (s *MemoryStorage) appendMemory(sample model.Sample) error {
 	if err := c.Append(sample.Point.Timestamp, sample.Point.Value); err != nil {
 		return err
 	}
+	id := s.register(key, sample)
+	s.meta[id].lastTS = sample.Point.Timestamp
 	s.pointCount++
 	return nil
 }
 
+// register returns the series' ID, assigning one and adding the series to the
+// index the first time it is seen. IDs are handed out in increasing order, so
+// every posting list is appended to rather than inserted into.
+func (s *MemoryStorage) register(key string, sample model.Sample) index.SeriesID {
+	if id, ok := s.ids[key]; ok {
+		return id
+	}
+	id := index.SeriesID(len(s.meta))
+	labels := copyLabels(sample.Labels)
+	s.meta = append(s.meta, seriesMeta{key: key, metric: sample.Metric, labels: labels})
+	s.ids[key] = id
+	s.index.Add(id, sample.Metric, labels)
+	return id
+}
+
+func copyLabels(l model.Labels) model.Labels {
+	out := make(model.Labels, len(l))
+	for k, v := range l {
+		out[k] = v
+	}
+	return out
+}
+
 // checkOrder reports whether the sample can be appended to its series
 // A compressed chunk is an append-only stream, so a sample that is not newer than the last one cannot be stored
+//
+// The check uses the series' own watermark rather than its head chunk, because
+// a flush empties the head: checking the chunk would let a sample older than
+// already-flushed data back in, and queries would return two values for one
+// timestamp.
 func (s *MemoryStorage) checkOrder(sample model.Sample) error {
 	key := model.SeriesKey(sample.Metric, sample.Labels)
-	c := s.series[key]
-	if c == nil || c.Count() == 0 {
-		return nil
+	id, ok := s.ids[key]
+	if !ok {
+		return nil // a new series accepts any timestamp
 	}
-	if sample.Point.Timestamp <= c.MaxTS() {
+	if last := s.meta[id].lastTS; sample.Point.Timestamp <= last {
 		return fmt.Errorf("%w: series %q got %d, last was %d",
-			compress.ErrOutOfOrder, key, sample.Point.Timestamp, c.MaxTS())
+			compress.ErrOutOfOrder, key, sample.Point.Timestamp, last)
 	}
 	return nil
 }
@@ -318,20 +365,84 @@ func syncDir(dir string) error {
 	return d.Sync()
 }
 
+// Query returns the samples in [start, end] for the one series identified
+// exactly by metric and labels.
 func (s *MemoryStorage) Query(metric string, labels model.Labels, start, end int64) ([]model.Point, error) {
 	key := model.SeriesKey(metric, labels)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	result := make([]model.Point, 0)
+	points, err := s.readSeries([]string{key}, start, end)
+	if err != nil {
+		return nil, err
+	}
+	if points[key] == nil {
+		return []model.Point{}, nil
+	}
+	return points[key], nil
+}
+
+// Series is one series matched by Select, with its samples in the range.
+type Series struct {
+	Metric string
+	Labels model.Labels
+	Points []model.Point
+}
+
+// Select returns every series carrying all of the matchers, with its samples
+// in [start, end], ordered by series key. Series with no samples in the range
+// are left out.
+//
+// The index is rebuilt from the WAL on startup but not yet from blocks, so a
+// series whose samples all predate a restart is not found.
+func (s *MemoryStorage) Select(matchers []index.Matcher, start, end int64) ([]Series, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	ids := s.index.Match(matchers...)
+	keys := make([]string, len(ids))
+	for i, id := range ids {
+		keys[i] = s.meta[id].key
+	}
+	sort.Strings(keys) // stable output, independent of when series were first seen
+
+	points, err := s.readSeries(keys, start, end)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]Series, 0, len(keys))
+	for _, key := range keys {
+		if len(points[key]) == 0 {
+			continue
+		}
+		m := s.meta[s.ids[key]]
+		result = append(result, Series{
+			Metric: m.metric,
+			Labels: copyLabels(m.labels),
+			Points: points[key],
+		})
+	}
+	return result, nil
+}
+
+// readSeries decodes the samples in [start, end] for each series key, from the
+// head and from every overlapping block, each series sorted by time. Blocks
+// are read once for all keys rather than once per key.
+func (s *MemoryStorage) readSeries(keys []string, start, end int64) (map[string][]model.Point, error) {
+	out := make(map[string][]model.Point, len(keys))
 
 	// in-memory head: the chunk is decoded from the start, since every sample depends on the one before it
-	if c := s.series[key]; c != nil {
+	for _, key := range keys {
+		c := s.series[key]
+		if c == nil {
+			continue
+		}
 		it := c.Iterator()
 		for it.Next() {
 			ts, v := it.At()
 			if ts >= start && ts <= end {
-				result = append(result, model.Point{Timestamp: ts, Value: v})
+				out[key] = append(out[key], model.Point{Timestamp: ts, Value: v})
 			}
 		}
 		if err := it.Err(); err != nil {
@@ -339,27 +450,29 @@ func (s *MemoryStorage) Query(metric string, labels model.Labels, start, end int
 		}
 	}
 
-	// on-disk blocks
-	blockPoints, err := s.queryBlocks(key, start, end)
-	if err != nil {
+	if err := s.readBlocks(out, keys, start, end); err != nil {
 		return nil, err
 	}
-	result = append(result, blockPoints...)
 
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Timestamp < result[j].Timestamp
-	})
-	return result, nil
+	for _, points := range out {
+		sort.Slice(points, func(i, j int) bool {
+			return points[i].Timestamp < points[j].Timestamp
+		})
+	}
+	return out, nil
 }
 
-// queryBlocks scans on-disk blocks, reading only those whose time range overlaps (block pruning).
-func (s *MemoryStorage) queryBlocks(key string, start, end int64) ([]model.Point, error) {
+// readBlocks adds the samples in [start, end] for each key from on-disk
+// blocks, reading only blocks whose time range overlaps (block pruning).
+func (s *MemoryStorage) readBlocks(out map[string][]model.Point, keys []string, start, end int64) error {
+	if len(keys) == 0 {
+		return nil
+	}
 	entries, err := os.ReadDir(s.blockDir)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	result := make([]model.Point, 0)
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasPrefix(name, blockFilePrefix) || !strings.HasSuffix(name, blockFileSuffix) {
@@ -367,32 +480,34 @@ func (s *MemoryStorage) queryBlocks(key string, start, end int64) ([]model.Point
 		}
 		data, err := os.ReadFile(filepath.Join(s.blockDir, name))
 		if err != nil {
-			return nil, err
+			return err
 		}
 		var b block
 		if err := json.Unmarshal(data, &b); err != nil {
-			return nil, err
+			return err
 		}
 		// skip blocks entirely outside the query range
 		if b.MaxTS < start || b.MinTS > end {
 			continue
 		}
-		bs, ok := b.Series[key]
-		if !ok {
-			continue
-		}
-		it := compress.NewChunkIterator(bs.TS, bs.Val, bs.Count)
-		for it.Next() {
-			ts, v := it.At()
-			if ts >= start && ts <= end {
-				result = append(result, model.Point{Timestamp: ts, Value: v})
+		for _, key := range keys {
+			bs, ok := b.Series[key]
+			if !ok {
+				continue
+			}
+			it := compress.NewChunkIterator(bs.TS, bs.Val, bs.Count)
+			for it.Next() {
+				ts, v := it.At()
+				if ts >= start && ts <= end {
+					out[key] = append(out[key], model.Point{Timestamp: ts, Value: v})
+				}
+			}
+			if err := it.Err(); err != nil {
+				return fmt.Errorf("decode block %s series %q: %w", name, key, err)
 			}
 		}
-		if err := it.Err(); err != nil {
-			return nil, fmt.Errorf("decode block %s series %q: %w", name, key, err)
-		}
 	}
-	return result, nil
+	return nil
 }
 
 func (s *MemoryStorage) Close() error {
