@@ -63,6 +63,22 @@ threshold to watch flushing happen:
 go run . -flush 5
 ```
 
+### Docker
+The image is a static binary on a distroless base, running as a non-root user,
+with the WAL and blocks in a volume at `/data`:
+
+```bash
+docker build -t minitsdb .
+docker run --rm -p 8080:8080 -v minitsdb-data:/data minitsdb
+```
+
+Flags go after the image name, for example `docker run --rm -p 8080:8080 -v
+minitsdb-data:/data minitsdb -flush 5`. The named volume outlives the
+container, so stopping and starting it exercises the same recovery path as
+restarting the binary. `docker stop` ends the process but not the machine,
+so every acknowledged write survives it even without `-sync` (see
+"Durability").
+
 ## Aggregation
 `/aggregate` evaluates a query the way Datadog does, in two stages:
 
@@ -316,6 +332,77 @@ are read back to rebuild the index and the ordering check; the samples
 themselves stay on disk until a query needs them. The WAL then replays only
 the samples written since the last checkpoint.
 
+## Design decisions
+Each choice below has a cost; the trade-off is the point.
+
+**Out-of-order samples are rejected, not buffered.** A Gorilla stream encodes
+each sample relative to the one before it, so a sample cannot be inserted into
+the middle of a chunk without re-encoding everything after it. Accepting only
+increasing timestamps keeps the head as one compressed stream per series, as
+Prometheus does. Late data is lost unless the sender orders it; a small
+uncompressed buffer, or a separate out-of-order head merged at query time,
+would accept it at the price of memory and a more complex read path.
+
+**Ordering is checked before the WAL write.** A sample that will be rejected
+must never enter the log, or replay would hit the same rejection and the log
+would describe a state the store cannot reach. The check reads a per-series
+watermark kept with the series' identity rather than the head chunk, because
+a flush empties the head; an earlier version read the chunk and accepted
+stale samples after every flush.
+
+**The WAL is not fsynced per write by default.** A process crash loses
+nothing, since written data is already in the OS page cache; only a power loss
+drops what arrived since the last flush. Fsyncing every append costs 887x
+throughput, so it is opt-in with `-sync`, the default Prometheus also picks.
+Group commit would be the middle ground.
+
+**A flush is ordered so that a crash never loses data.** The block is written
+to a temporary file, fsynced, renamed into place, and its directory fsynced,
+all before the WAL is truncated. Truncating first would open a window in which
+the samples exist nowhere. The opposite window, a crash after the rename but
+before the truncate, leaves the samples in both; replay skips any sample at or
+before its series' watermark, which startup has already restored from the
+blocks, so nothing is stored twice.
+
+**Series identity lives apart from series data.** A series' ID, labels, index
+entries and ordering watermark stay in memory when its samples are flushed,
+and every block records the identity of the series it holds. Flushes move
+data, not identity, so lookups and ordering survive flushes and restarts.
+
+**The metric name is just a label.** Indexing it as `__name__` makes matching
+on a metric and on a label the same operation, which is also why `/select` can
+leave the metric out.
+
+**Matchers are equality only.** Equality covers what the inverted index is
+for, posting-list intersection, and keeps each matcher a single lookup. `!=`
+needs every series minus a posting list, and a regular expression needs a
+scan of every value of a label; both were left out.
+
+**Queries roll up, then aggregate.** Following Datadog's model, each series is
+reduced to buckets before series are combined. Gauges and counters (through
+`rate`) share one evaluation path, and downsampling is the same operation as
+a rollup. Buckets align to multiples of `step` and empty ones are omitted, so
+results do not shift with the query range and never outgrow their data.
+
+**Blocks are JSON.** They can be read with `cat` and needed no format code,
+which mattered while the layout kept changing. The cost is measured: base64
+and JSON keys roughly halve the compression ratio of a constant series. A
+binary format is the first thing to change once the layout settles.
+
+**No block format version.** The one format change so far that still parsed,
+blocks gaining series identity, is caught by checking that every series has a
+metric, which every write requires. A version field earns its keep once a
+change can parse cleanly while meaning something different.
+
+**Failures are reported, not absorbed.** A block that fails to decode fails
+the query instead of returning whatever did decode; an unparseable `start` is
+a `400`, not a silent default; an unconstrained `/select` is refused instead
+of returning every series. An incomplete answer that looks complete is the
+hardest failure to notice downstream.
+
+**Standard library only.** Every piece, from the bit writer to the index, is in
+this repository, which is the purpose of the project.
+
 ## Status / Roadmap
 - [x] In-memory store + HTTP API
 - [x] WAL persistence & recovery
@@ -333,6 +420,7 @@ the samples written since the last checkpoint.
 - [x] Query engine: rollups (incl. `rate` and downsampling) and aggregation
   across series, grouped by label (`GET /aggregate`)
 - [ ] Query language parser
+- [x] Container image (Docker, distroless, non-root)
 
 ## Tech
 Go, standard library only (no external dependencies yet).

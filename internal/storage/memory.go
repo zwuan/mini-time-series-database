@@ -169,7 +169,7 @@ func (s *MemoryStorage) replay(walPath string) error {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	count := 0
+	count, skipped := 0, 0
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -179,15 +179,23 @@ func (s *MemoryStorage) replay(walPath string) error {
 		if err := json.Unmarshal(line, &sample); err != nil {
 			return err
 		}
+		// A sample at or before its series' watermark is already in a block:
+		// the process stopped after a flush renamed the block into place but
+		// before it truncated the WAL. Appends only log samples newer than the
+		// watermark, so nothing else can fail this check.
+		if s.checkOrder(sample) != nil {
+			skipped++
+			continue
+		}
 		if err := s.appendMemory(sample); err != nil {
-			return fmt.Errorf("replay sample %d: %w", count+1, err)
+			return fmt.Errorf("replay sample %d: %w", count+skipped+1, err)
 		}
 		count++
 	}
 	if err := scanner.Err(); err != nil {
 		return err
 	}
-	log.Printf("WAL replay done: restored %d samples", count)
+	log.Printf("WAL replay done: restored %d samples, skipped %d already in blocks", count, skipped)
 	return nil
 }
 
