@@ -1,0 +1,6 @@
+.git
+data/
+minitsdb
+*.exe
+.DS_Store
+.vscode/
