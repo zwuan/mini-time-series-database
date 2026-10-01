@@ -384,9 +384,9 @@ func (s *MemoryStorage) Query(metric string, labels model.Labels, start, end int
 
 // Series is one series matched by Select, with its samples in the range.
 type Series struct {
-	Metric string
-	Labels model.Labels
-	Points []model.Point
+	Metric string        `json:"metric"`
+	Labels model.Labels  `json:"labels"`
+	Points []model.Point `json:"points"`
 }
 
 // Select returns every series carrying all of the matchers, with its samples
