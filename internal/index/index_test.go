@@ -208,3 +208,80 @@ func BenchmarkIntersect(b *testing.B) {
 		}
 	})
 }
+
+// intersectLinear is the baseline for galloping: a plain two-pointer merge
+// that steps through both lists one element at a time.
+func intersectLinear(a, b []SeriesID) []SeriesID {
+	out := a[:0]
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i] == b[j]:
+			out = append(out, a[i])
+			i++
+			j++
+		case a[i] < b[j]:
+			i++
+		default:
+			j++
+		}
+	}
+	return out
+}
+
+// intersectInOrder is the baseline for shortest-first ordering: lists are
+// intersected in the order given.
+func intersectInOrder(lists [][]SeriesID, two func(a, b []SeriesID) []SeriesID) []SeriesID {
+	result := append([]SeriesID(nil), lists[0]...)
+	for _, l := range lists[1:] {
+		result = two(result, l)
+	}
+	return result
+}
+
+func buildPostings(n int, stride SeriesID) []SeriesID {
+	l := make([]SeriesID, n)
+	for i := range l {
+		l[i] = SeriesID(i) * stride
+	}
+	return l
+}
+
+// BenchmarkIntersectOptimizations measures each optimisation against the naive
+// version on the same input, so the speedup is like for like.
+func BenchmarkIntersectOptimizations(b *testing.B) {
+	big := buildPostings(100000, 1)
+	medium := buildPostings(10000, 10)
+	tiny := buildPostings(10, 10000)
+
+	// The baselines must agree with Intersect, or the comparison means nothing.
+	want := Intersect([][]SeriesID{big, medium, tiny})
+	if got := intersectInOrder([][]SeriesID{big, medium, tiny}, intersectLinear); !reflect.DeepEqual(got, want) {
+		b.Fatalf("baseline disagrees with Intersect: %v vs %v", got, want)
+	}
+
+	// 10 series against 100k: galloping skips most of the long list.
+	b.Run("skewed/linear", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			intersectInOrder([][]SeriesID{tiny, big}, intersectLinear)
+		}
+	})
+	b.Run("skewed/galloping", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			Intersect([][]SeriesID{tiny, big})
+		}
+	})
+
+	// Three lists given longest first: the naive version carries 100k IDs into
+	// the first pass, while shortest-first starts from 10.
+	b.Run("three/in-order-linear", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			intersectInOrder([][]SeriesID{big, medium, tiny}, intersectLinear)
+		}
+	})
+	b.Run("three/shortest-first-galloping", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			Intersect([][]SeriesID{big, medium, tiny})
+		}
+	})
+}

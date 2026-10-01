@@ -55,10 +55,16 @@ func WithSyncOnWrite() Option {
 	return func(s *MemoryStorage) { s.syncOnWrite = true }
 }
 
+// blockSeries is one series inside a block: its identity, so the index can be
+// rebuilt from blocks on startup, and its compressed samples. MaxTS lets
+// startup restore the series' ordering watermark without decoding samples.
 type blockSeries struct {
-	Count int    `json:"count"`
-	TS    []byte `json:"ts"`
-	Val   []byte `json:"val"`
+	Metric string       `json:"metric"`
+	Labels model.Labels `json:"labels"`
+	MaxTS  int64        `json:"max_ts"`
+	Count  int          `json:"count"`
+	TS     []byte       `json:"ts"`
+	Val    []byte       `json:"val"`
 }
 
 // block is the immutable on-disk block file format.
@@ -115,7 +121,14 @@ func NewMemoryStorage(walPath string, flushThreshold int, opts ...Option) (*Memo
 	}
 	s.BlockSeq = seq
 
-	// Blocks stay on disk and are not loaded back; the WAL only holds samples written since the last checkpoint.
+	// Blocks first, then the WAL: every sample in the WAL is newer than the
+	// flushed samples of its series, so this order leaves each series'
+	// watermark at its true latest timestamp. Only series identities are read
+	// from blocks; their samples stay on disk until a query needs them.
+	if err := s.indexBlocks(); err != nil {
+		f.Close()
+		return nil, err
+	}
 	if err := s.replay(walPath); err != nil {
 		f.Close()
 		return nil, err
@@ -189,7 +202,7 @@ func (s *MemoryStorage) appendMemory(sample model.Sample) error {
 	if err := c.Append(sample.Point.Timestamp, sample.Point.Value); err != nil {
 		return err
 	}
-	id := s.register(key, sample)
+	id := s.register(key, sample.Metric, sample.Labels)
 	s.meta[id].lastTS = sample.Point.Timestamp
 	s.pointCount++
 	return nil
@@ -198,16 +211,64 @@ func (s *MemoryStorage) appendMemory(sample model.Sample) error {
 // register returns the series' ID, assigning one and adding the series to the
 // index the first time it is seen. IDs are handed out in increasing order, so
 // every posting list is appended to rather than inserted into.
-func (s *MemoryStorage) register(key string, sample model.Sample) index.SeriesID {
+func (s *MemoryStorage) register(key, metric string, labels model.Labels) index.SeriesID {
 	if id, ok := s.ids[key]; ok {
 		return id
 	}
 	id := index.SeriesID(len(s.meta))
-	labels := copyLabels(sample.Labels)
-	s.meta = append(s.meta, seriesMeta{key: key, metric: sample.Metric, labels: labels})
+	labels = copyLabels(labels)
+	s.meta = append(s.meta, seriesMeta{key: key, metric: metric, labels: labels, lastTS: math.MinInt64})
 	s.ids[key] = id
-	s.index.Add(id, sample.Metric, labels)
+	s.index.Add(id, metric, labels)
 	return id
+}
+
+// indexBlocks registers every series found in on-disk blocks and restores
+// its ordering watermark, so that after a restart a series whose samples were
+// all flushed can still be selected and still rejects older samples.
+func (s *MemoryStorage) indexBlocks() error {
+	entries, err := os.ReadDir(s.blockDir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, blockFilePrefix) || !strings.HasSuffix(name, blockFileSuffix) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(s.blockDir, name))
+		if err != nil {
+			return err
+		}
+		var b block
+		if err := json.Unmarshal(data, &b); err != nil {
+			return fmt.Errorf("block %s: %w", name, err)
+		}
+
+		// Sorted so IDs come out the same on every restart.
+		keys := make([]string, 0, len(b.Series))
+		for key := range b.Series {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
+		for _, key := range keys {
+			bs := b.Series[key]
+			// A block written before series identity was stored still parses,
+			// with the new fields left at their zero values. Every write needs
+			// a metric, so an empty one can only mean such a block; indexing it
+			// would leave the series unselectable without any sign why.
+			if bs.Metric == "" {
+				return fmt.Errorf("block %s: series %q has no metric; the block predates series labels in blocks, remove %s to start fresh", name, key, s.blockDir)
+			}
+			id := s.register(key, bs.Metric, bs.Labels)
+			if bs.MaxTS > s.meta[id].lastTS {
+				s.meta[id].lastTS = bs.MaxTS
+			}
+		}
+	}
+	log.Printf("indexed %d series from blocks", len(s.meta))
+	return nil
 }
 
 func copyLabels(l model.Labels) model.Labels {
@@ -288,7 +349,15 @@ func (s *MemoryStorage) flush() error {
 			continue
 		}
 		tsBuf, valBuf := c.Bytes()
-		b.Series[key] = blockSeries{Count: c.Count(), TS: tsBuf, Val: valBuf}
+		m := s.meta[s.ids[key]]
+		b.Series[key] = blockSeries{
+			Metric: m.metric,
+			Labels: m.labels,
+			MaxTS:  c.MaxTS(),
+			Count:  c.Count(),
+			TS:     tsBuf,
+			Val:    valBuf,
+		}
 		if c.MinTS() < b.MinTS {
 			b.MinTS = c.MinTS()
 		}
@@ -392,9 +461,6 @@ type Series struct {
 // Select returns every series carrying all of the matchers, with its samples
 // in [start, end], ordered by series key. Series with no samples in the range
 // are left out.
-//
-// The index is rebuilt from the WAL on startup but not yet from blocks, so a
-// series whose samples all predate a restart is not found.
 func (s *MemoryStorage) Select(matchers []index.Matcher, start, end int64) ([]Series, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
